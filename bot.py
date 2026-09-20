@@ -1068,4 +1068,253 @@ async def edit_channel_save(
     await db.update_channel(
         data["channel_id"],
         *parsed
-   
+   )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Channel updated.",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================
+# DELETE CHANNEL
+# =========================
+
+@dp.callback_query(
+    F.data.startswith("admin:delete:")
+)
+async def delete_channel(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    channel_id = int(
+        callback.data.split(":")[-1]
+    )
+
+    await db.delete_channel(
+        channel_id
+    )
+
+    await callback.answer(
+        "Deleted ✅"
+    )
+
+    await show_channels(
+        callback
+    )
+
+
+# =========================
+# STATISTICS
+# =========================
+
+@dp.callback_query(F.data == "admin:stats")
+async def stats(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    data = await db.stats()
+
+    await callback.message.edit_text(
+        "📊 <b>BOT STATISTICS</b>\n\n"
+        f"👥 Users: <b>{data['users']}</b>\n"
+        f"🆔 UID submissions: <b>{data['submissions']}</b>\n"
+        f"📢 Join buttons: <b>{data['channels']}/4</b>",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# PREVIEW
+# =========================
+
+@dp.callback_query(F.data == "admin:preview")
+async def preview(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    await callback.answer(
+        "Preview sent."
+    )
+
+    await show_force_join(
+        callback.from_user.id
+    )
+
+
+# =========================
+# UID
+# =========================
+
+@dp.message()
+async def catch_uid(
+    message: Message
+):
+
+    if (
+        message.text
+        and message.text.startswith("/")
+    ):
+        return
+
+    if not message.text:
+        return
+
+    if is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if not await membership_ok(
+        message.from_user.id
+    ):
+
+        await show_force_join(
+            message.from_user.id
+        )
+
+        return
+
+    uid = message.text.strip()
+
+    if len(uid) < 3 or len(uid) > 100:
+
+        await message.answer(
+            "❌ Please send a valid UID."
+        )
+
+        return
+
+    await db.save_submission(
+        message.from_user.id,
+        uid
+    )
+
+    user = message.from_user
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "No username"
+    )
+
+    notification = (
+        "🆔 <b>NEW UID SUBMISSION</b>\n\n"
+        f"👤 Name: {escape(user.full_name)}\n"
+        f"🔗 Username: {escape(username)}\n"
+        f"👤 User ID: <code>{user.id}</code>\n"
+        f"🆔 UID: <code>{escape(uid)}</code>"
+    )
+
+    sent = 0
+
+    for admin_id in ADMIN_IDS:
+
+        try:
+
+            await bot.send_message(
+                admin_id,
+                notification
+            )
+
+            sent += 1
+
+        except Exception:
+
+            logging.exception(
+                "Could not notify admin %s",
+                admin_id
+            )
+
+    if sent:
+
+        await message.answer(
+            "✅ UID received.\n\n"
+            "It has been forwarded to the admin "
+            "for manual handling."
+        )
+
+    else:
+
+        await message.answer(
+            "✅ UID received."
+        )
+
+
+# =========================
+# START BOT
+# =========================
+
+async def main():
+
+    await db.init()
+
+    logging.info(
+        "================================"
+    )
+
+    logging.info(
+        "BOT STARTED"
+    )
+
+    logging.info(
+        "DATABASE: %s",
+        db.path
+    )
+
+    logging.info(
+        "ADMIN IDS: %s",
+        sorted(ADMIN_IDS)
+    )
+
+    logging.info(
+        "================================"
+    )
+
+    await dp.start_polling(
+        bot
+    )
+
+
+if __name__ == "__main__":
+
+    asyncio.run(
+        main()
+)
