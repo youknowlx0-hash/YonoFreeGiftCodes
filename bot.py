@@ -1,273 +1,1071 @@
 import os
 import asyncio
 import logging
-from typing import Optional
+from html import escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto
-)
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 from db import DB
 
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+# =========================
+# CONFIG
+# =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///bot.db")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///bot.db"
+).strip()
+
+
+def parse_admin_ids(raw):
+    ids = set()
+
+    raw = raw.replace(";", ",")
+
+    for value in raw.split(","):
+        value = value.strip()
+
+        if value.isdigit():
+            ids.add(int(value))
+
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
+
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+    raise RuntimeError(
+        "BOT_TOKEN is missing. Add it in Railway Variables."
+    )
+
+
 if not ADMIN_IDS:
-    raise RuntimeError("ADMIN_IDS is missing")
+    raise RuntimeError(
+        "ADMIN_IDS is missing/invalid. "
+        "Add your numeric Telegram ID."
+    )
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-db = DB(DB_URL)
 
-class AdminStates(StatesGroup):
-    waiting_message = State()
-    waiting_photo = State()
-    waiting_channel = State()
-    waiting_remove_channel = State()
-    waiting_link = State()
-    waiting_gift_text = State()
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
+    )
+)
 
-def is_admin(user_id: int) -> bool:
+dp = Dispatcher(
+    storage=MemoryStorage()
+)
+
+db = DB(DATABASE_URL)
+
+
+# =========================
+# STATES
+# =========================
+
+class AdminState(StatesGroup):
+
+    force_text = State()
+
+    force_photo = State()
+
+    gift_text = State()
+
+    add_channel = State()
+
+    edit_channel = State()
+
+
+# =========================
+# HELPERS
+# =========================
+
+def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-async def get_settings():
-    return await db.get_settings()
 
-async def force_join_keyboard(settings):
+def admin_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text="📝 Force-Join Message",
+                    callback_data="admin:force_text"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🖼 Force-Join Photo",
+                    callback_data="admin:force_photo"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="📢 Manage Channels",
+                    callback_data="admin:channels"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎁 Offer Message",
+                    callback_data="admin:gift"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="📊 Statistics",
+                    callback_data="admin:stats"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="👁 Preview",
+                    callback_data="admin:preview"
+                )
+            ]
+
+        ]
+    )
+
+
+def back_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Back",
+                    callback_data="admin:back"
+                )
+            ]
+
+        ]
+    )
+
+
+async def send_admin_panel(message):
+
+    await message.answer(
+        "⚙️ <b>ADMIN PANEL</b>\n\n"
+        "Bot settings yahin se manage karo:",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================
+# FORCE JOIN
+# =========================
+
+async def force_keyboard():
+
+    settings = await db.get_settings()
+
     rows = []
-    for ch in settings["channels"]:
-        rows.append([InlineKeyboardButton(text=ch["title"], url=ch["url"])])
-    rows.append([InlineKeyboardButton(text="✅ I've Joined — Verify", callback_data="verify_join")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def check_membership(user_id: int, settings) -> bool:
-    # Telegram can verify membership for normal/private channels when the bot
-    # has access to the channel. Folder links are not directly checkable.
-    for ch in settings["channels"]:
-        chat_id = ch.get("chat_id")
+    for channel in settings["channels"]:
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=channel["title"],
+                    url=channel["url"]
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="✅ I've Joined — Verify",
+                callback_data="verify"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+async def membership_ok(user_id):
+
+    settings = await db.get_settings()
+
+    if not settings["channels"]:
+        return True
+
+    for channel in settings["channels"]:
+
+        chat_id = str(
+            channel.get("chat_id", "")
+        ).strip()
+
+        # URL-only button
         if not chat_id:
             continue
+
         try:
-            member = await bot.get_chat_member(chat_id=int(chat_id), user_id=user_id)
-            if member.status in ("left", "kicked"):
+
+            member = await bot.get_chat_member(
+                chat_id=int(chat_id),
+                user_id=user_id
+            )
+
+            if member.status in (
+                "left",
+                "kicked"
+            ):
                 return False
-        except Exception as e:
-            logging.warning("Membership check failed for %s: %s", chat_id, e)
-            # If a channel cannot be checked, do not silently block the user.
-            continue
+
+        except Exception:
+
+            logging.exception(
+                "Membership check failed: %s",
+                chat_id
+            )
+
+            return False
+
     return True
 
-async def send_force_join(message: Message):
-    settings = await get_settings()
-    kb = await force_join_keyboard(settings)
-    text = settings["force_text"]
-    photo = settings.get("force_photo")
-    if photo:
-        await message.answer_photo(photo=photo, caption=text, reply_markup=kb)
-    else:
-        await message.answer(text, reply_markup=kb)
 
-async def send_main_offer(user_id: int):
-    settings = await get_settings()
-    await bot.send_message(
-        user_id,
-        settings["gift_text"],
-        disable_web_page_preview=False
+async def show_force_join(user_id):
+
+    settings = await db.get_settings()
+
+    keyboard = await force_keyboard()
+
+    text = settings.get(
+        "force_text"
+    ) or "Please join the required channels."
+
+    photo = settings.get(
+        "force_photo"
     )
+
+    if photo:
+
+        await bot.send_photo(
+            user_id,
+            photo,
+            caption=text,
+            reply_markup=keyboard
+        )
+
+    else:
+
+        await bot.send_message(
+            user_id,
+            text,
+            reply_markup=keyboard
+        )
+
+
+# =========================
+# START
+# =========================
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    await db.upsert_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    settings = await get_settings()
-    if await check_membership(message.from_user.id, settings):
-        await send_main_offer(message.from_user.id)
-    else:
-        await send_force_join(message)
 
-@dp.callback_query(F.data == "verify_join")
-async def verify_join(callback: CallbackQuery):
-    settings = await get_settings()
-    if await check_membership(callback.from_user.id, settings):
-        await callback.message.answer(settings["gift_text"])
-        await callback.answer("Verified ✅")
-    else:
-        await callback.answer("Please join all required channels first.", show_alert=True)
+    await db.upsert_user(
+        message.from_user.id,
+        message.from_user.full_name,
+        message.from_user.username
+    )
 
-@dp.message(F.text)
-async def receive_uid(message: Message):
-    if message.text.startswith("/"):
-        return
-    settings = await get_settings()
-    if not await check_membership(message.from_user.id, settings):
-        await send_force_join(message)
-        return
+    if await membership_ok(
+        message.from_user.id
+    ):
 
-    uid = message.text.strip()
-    if 3 <= len(uid) <= 100:
-        await db.save_submission(message.from_user.id, uid)
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"📥 <b>New UID Submission</b>\n\n"
-                    f"👤 Name: {message.from_user.full_name}\n"
-                    f"🔹 Username: @{message.from_user.username or 'N/A'}\n"
-                    f"🆔 User ID: <code>{message.from_user.id}</code>\n"
-                    f"🎮 UID: <code>{uid}</code>"
+        settings = await db.get_settings()
+
+        await message.answer(
+            settings["gift_text"]
+        )
+
+        if is_admin(
+            message.from_user.id
+        ):
+
+            await message.answer(
+                "⚙️ Admin account detected.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="⚙️ Open Admin Panel",
+                                callback_data="admin:open"
+                            )
+                        ]
+                    ]
                 )
-            except Exception:
-                pass
-        await message.answer("✅ UID received. Admin has been notified.")
+            )
+
     else:
-        await message.answer("Please send a valid UID.")
+
+        await show_force_join(
+            message.from_user.id
+        )
+
+
+# =========================
+# ADMIN COMMAND
+# =========================
 
 @dp.message(Command("admin"))
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
+async def admin_command(message: Message):
+
+    allowed = is_admin(
+        message.from_user.id
+    )
+
+    logging.info(
+        "ADMIN COMMAND | user_id=%s | allowed=%s | configured=%s",
+        message.from_user.id,
+        allowed,
+        sorted(ADMIN_IDS)
+    )
+
+    if not allowed:
+
+        await message.answer(
+            "⛔ <b>Access denied.</b>\n\n"
+            "Your Telegram ID:\n"
+            f"<code>{message.from_user.id}</code>\n\n"
+            "This ID is not configured as an admin."
+        )
+
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Force-Join Text", callback_data="a_force_text")],
-        [InlineKeyboardButton(text="🖼 Force-Join Photo", callback_data="a_force_photo")],
-        [InlineKeyboardButton(text="📢 Channels / Buttons", callback_data="a_channels")],
-        [InlineKeyboardButton(text="🎁 Offer Message", callback_data="a_gift_text")],
-        [InlineKeyboardButton(text="📊 Stats", callback_data="a_stats")],
-    ])
-    await message.answer("⚙️ <b>Bot Admin Panel</b>\n\nEverything important can be changed here.", reply_markup=kb)
 
-@dp.callback_query(F.data == "a_force_text")
-async def a_force_text(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id): return
-    await state.set_state(AdminStates.waiting_message)
-    await c.message.answer("Send the new force-join message. HTML formatting is supported.")
+    await send_admin_panel(
+        message
+    )
 
-@dp.message(AdminStates.waiting_message)
-async def save_force_text(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await db.set_setting("force_text", message.text)
+
+# Also allows typing "admin"
+@dp.message(F.text.casefold() == "admin")
+async def admin_text(message: Message):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+
+        await message.answer(
+            "⛔ Access denied."
+        )
+
+        return
+
+    await send_admin_panel(
+        message
+    )
+
+
+# =========================
+# ADMIN OPEN / BACK
+# =========================
+
+@dp.callback_query(F.data == "admin:open")
+async def admin_open(callback: CallbackQuery):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    await callback.message.edit_text(
+        "⚙️ <b>ADMIN PANEL</b>\n\n"
+        "Bot settings yahin se manage karo:",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin:back")
+async def admin_back(callback: CallbackQuery):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    await callback.message.edit_text(
+        "⚙️ <b>ADMIN PANEL</b>\n\n"
+        "Bot settings yahin se manage karo:",
+        reply_markup=admin_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================
+# VERIFY
+# =========================
+
+@dp.callback_query(F.data == "verify")
+async def verify(callback: CallbackQuery):
+
+    ok = await membership_ok(
+        callback.from_user.id
+    )
+
+    if ok:
+
+        settings = await db.get_settings()
+
+        await callback.message.answer(
+            settings["gift_text"]
+        )
+
+        await callback.answer(
+            "Verified ✅"
+        )
+
+    else:
+
+        await callback.answer(
+            "Please join all required channels first.",
+            show_alert=True
+        )
+
+
+# =========================
+# FORCE MESSAGE
+# =========================
+
+@dp.callback_query(F.data == "admin:force_text")
+async def force_text_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    current = await db.get_setting(
+        "force_text"
+    )
+
+    await state.set_state(
+        AdminState.force_text
+    )
+
+    await callback.message.edit_text(
+        "📝 <b>Force-Join Message</b>\n\n"
+        "Current message:\n\n"
+        f"{current}\n\n"
+        "Send the new message now.\n"
+        "HTML formatting supported.\n\n"
+        "Use /cancel to cancel.",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.message(AdminState.force_text)
+async def force_text_save(
+    message: Message,
+    state: FSMContext
+):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.text == "/cancel":
+
+        await state.clear()
+
+        await send_admin_panel(
+            message
+        )
+
+        return
+
+    await db.set_setting(
+        "force_text",
+        message.text
+    )
+
     await state.clear()
-    await message.answer("✅ Force-join message updated.")
 
-@dp.callback_query(F.data == "a_force_photo")
-async def a_force_photo(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id): return
-    await state.set_state(AdminStates.waiting_photo)
-    await c.message.answer("Send the new photo. Send /remove_photo to remove it.")
+    await message.answer(
+        "✅ Force-join message updated.",
+        reply_markup=admin_keyboard()
+    )
 
-@dp.message(AdminStates.waiting_photo)
-async def save_force_photo(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
+
+# =========================
+# FORCE PHOTO
+# =========================
+
+@dp.callback_query(F.data == "admin:force_photo")
+async def force_photo_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    await state.set_state(
+        AdminState.force_photo
+    )
+
+    await callback.message.edit_text(
+        "🖼 <b>Force-Join Photo</b>\n\n"
+        "Send a photo now.\n\n"
+        "Send /remove_photo to remove it.\n"
+        "Use /cancel to cancel.",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.message(AdminState.force_photo)
+async def force_photo_save(
+    message: Message,
+    state: FSMContext
+):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.text == "/cancel":
+
+        await state.clear()
+
+        await send_admin_panel(
+            message
+        )
+
+        return
+
     if message.text == "/remove_photo":
-        await db.set_setting("force_photo", "")
+
+        await db.set_setting(
+            "force_photo",
+            ""
+        )
+
         await state.clear()
-        await message.answer("✅ Photo removed.")
+
+        await message.answer(
+            "✅ Force-join photo removed.",
+            reply_markup=admin_keyboard()
+        )
+
         return
+
     if not message.photo:
-        await message.answer("Please send a photo.")
+
+        await message.answer(
+            "Please send a photo or /cancel."
+        )
+
         return
-    await db.set_setting("force_photo", message.photo[-1].file_id)
-    await state.clear()
-    await message.answer("✅ Force-join photo updated.")
 
-@dp.callback_query(F.data == "a_gift_text")
-async def a_gift_text(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id): return
-    await state.set_state(AdminStates.waiting_gift_text)
-    await c.message.answer("Send the message users should receive after verification.")
+    file_id = message.photo[-1].file_id
 
-@dp.message(AdminStates.waiting_gift_text)
-async def save_gift_text(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    await db.set_setting("gift_text", message.text)
-    await state.clear()
-    await message.answer("✅ Offer message updated.")
-
-@dp.callback_query(F.data == "a_channels")
-async def a_channels(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return
-    settings = await get_settings()
-    rows = []
-    for ch in settings["channels"]:
-        rows.append([
-            InlineKeyboardButton(text=f"✏️ {ch['title']}", callback_data=f"edit_ch:{ch['id']}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"del_ch:{ch['id']}")
-        ])
-    if len(settings["channels"]) < 4:
-        rows.append([InlineKeyboardButton(text="➕ Add Channel", callback_data="add_ch")])
-    rows.append([InlineKeyboardButton(text="🔙 Admin", callback_data="back_admin")])
-    await c.message.answer("📢 <b>Channels</b>\nMax 4 entries. A link can be public, private invite, or a Telegram folder link.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-@dp.callback_query(F.data == "add_ch")
-async def add_ch(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id): return
-    settings = await get_settings()
-    if len(settings["channels"]) >= 4:
-        await c.answer("Maximum 4 channels.", show_alert=True)
-        return
-    await state.set_state(AdminStates.waiting_channel)
-    await c.message.answer(
-        "Send one line in this format:\n"
-        "<code>Button Name | https://t.me/... | CHAT_ID(optional)</code>\n\n"
-        "For membership verification, add the numeric chat ID and make the bot an admin in that channel.\n"
-        "For folder links, leave CHAT_ID empty; Telegram does not expose folder membership to bots."
+    await db.set_setting(
+        "force_photo",
+        file_id
     )
 
-@dp.message(AdminStates.waiting_channel)
-async def save_channel(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    parts = [p.strip() for p in message.text.split("|")]
-    if len(parts) < 2:
-        await message.answer("Format: Button Name | https://t.me/... | CHAT_ID(optional)")
+    await state.clear()
+
+    await message.answer(
+        "✅ Force-join photo updated.",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================
+# OFFER MESSAGE
+# =========================
+
+@dp.callback_query(F.data == "admin:gift")
+async def gift_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
         return
-    title, url = parts[0], parts[1]
-    chat_id = parts[2] if len(parts) > 2 else ""
-    settings = await get_settings()
-    if len(settings["channels"]) >= 4:
+
+    current = await db.get_setting(
+        "gift_text"
+    )
+
+    await state.set_state(
+        AdminState.gift_text
+    )
+
+    await callback.message.edit_text(
+        "🎁 <b>Offer Message</b>\n\n"
+        f"Current:\n{current}\n\n"
+        "Send the new message.\n\n"
+        "Use /cancel to cancel.",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.message(AdminState.gift_text)
+async def gift_save(
+    message: Message,
+    state: FSMContext
+):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.text == "/cancel":
+
         await state.clear()
-        await message.answer("Maximum 4 channels.")
+
+        await send_admin_panel(
+            message
+        )
+
         return
-    await db.add_channel(title, url, chat_id)
-    await state.clear()
-    await message.answer("✅ Channel/button added.")
 
-@dp.callback_query(F.data.startswith("del_ch:"))
-async def del_ch(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return
-    cid = int(c.data.split(":")[1])
-    await db.delete_channel(cid)
-    await c.answer("Deleted.")
-    await a_channels(c)
-
-@dp.callback_query(F.data == "a_stats")
-async def a_stats(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return
-    s = await db.stats()
-    await c.message.answer(
-        f"📊 <b>Stats</b>\n\n"
-        f"👥 Users: <b>{s['users']}</b>\n"
-        f"📥 UID submissions: <b>{s['submissions']}</b>"
+    await db.set_setting(
+        "gift_text",
+        message.text
     )
 
-@dp.callback_query(F.data == "back_admin")
-async def back_admin(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return
-    await c.message.answer("Use /admin to open the panel.")
+    await state.clear()
 
-async def main():
-    await db.init()
-    await dp.start_polling(bot)
+    await message.answer(
+        "✅ Offer message updated.",
+        reply_markup=admin_keyboard()
+    )
 
-if __name__ == "__main__":
-    asyncio.run(main())
+
+# =========================
+# CHANNEL MENU
+# =========================
+
+async def show_channels(
+    target
+):
+
+    settings = await db.get_settings()
+
+    rows = []
+
+    for channel in settings["channels"]:
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"✏️ {channel['title']}",
+                    callback_data=f"admin:edit:{channel['id']}"
+                ),
+
+                InlineKeyboardButton(
+                    text="🗑",
+                    callback_data=f"admin:delete:{channel['id']}"
+                )
+            ]
+        )
+
+    if len(settings["channels"]) < 4:
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="➕ Add Channel",
+                    callback_data="admin:add_channel"
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Back",
+                callback_data="admin:back"
+            )
+        ]
+    )
+
+    text = (
+        "📢 <b>MANAGE CHANNELS</b>\n\n"
+        f"Configured: <b>{len(settings['channels'])}/4</b>\n\n"
+        "Format:\n"
+        "<code>Button Name | Link | Chat ID</code>\n\n"
+        "Chat ID optional."
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+    if isinstance(
+        target,
+        CallbackQuery
+    ):
+
+        await target.message.edit_text(
+            text,
+            reply_markup=keyboard
+        )
+
+    else:
+
+        await target.answer(
+            text,
+            reply_markup=keyboard
+        )
+
+
+@dp.callback_query(F.data == "admin:channels")
+async def channels_menu(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    await show_channels(
+        callback
+    )
+
+    await callback.answer()
+
+
+# =========================
+# ADD CHANNEL
+# =========================
+
+@dp.callback_query(F.data == "admin:add_channel")
+async def add_channel_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    settings = await db.get_settings()
+
+    if len(settings["channels"]) >= 4:
+
+        await callback.answer(
+            "Maximum 4 buttons.",
+            show_alert=True
+        )
+
+        return
+
+    await state.set_state(
+        AdminState.add_channel
+    )
+
+    await callback.message.edit_text(
+        "➕ <b>Add Channel Button</b>\n\n"
+        "Example:\n"
+        "<code>Channel 1 | https://t.me/example | -1001234567890</code>\n\n"
+        "URL-only:\n"
+        "<code>Channel 1 | https://t.me/example</code>\n\n"
+        "Use /cancel to cancel.",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+def parse_channel(text):
+
+    parts = [
+        x.strip()
+        for x in text.split("|")
+    ]
+
+    if len(parts) not in (2, 3):
+        return None
+
+    title = parts[0]
+    url = parts[1]
+
+    chat_id = (
+        parts[2]
+        if len(parts) == 3
+        else ""
+    )
+
+    if not title or not url:
+        return None
+
+    if not (
+        url.startswith("https://t.me/")
+        or url.startswith("http://t.me/")
+        or url.startswith("https://telegram.me/")
+        or url.startswith("http://telegram.me/")
+    ):
+        return None
+
+    return title, url, chat_id
+
+
+@dp.message(AdminState.add_channel)
+async def add_channel_save(
+    message: Message,
+    state: FSMContext
+):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.text == "/cancel":
+
+        await state.clear()
+
+        await send_admin_panel(
+            message
+        )
+
+        return
+
+    parsed = parse_channel(
+        message.text or ""
+    )
+
+    if not parsed:
+
+        await message.answer(
+            "❌ Invalid format.\n\n"
+            "Example:\n"
+            "<code>Channel 1 | https://t.me/example | -1001234567890</code>"
+        )
+
+        return
+
+    settings = await db.get_settings()
+
+    if len(settings["channels"]) >= 4:
+
+        await state.clear()
+
+        await message.answer(
+            "Maximum 4 channels.",
+            reply_markup=admin_keyboard()
+        )
+
+        return
+
+    await db.add_channel(
+        *parsed
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Channel button added.",
+        reply_markup=admin_keyboard()
+    )
+
+
+# =========================
+# EDIT CHANNEL
+# =========================
+
+@dp.callback_query(
+    F.data.startswith("admin:edit:")
+)
+async def edit_channel_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+
+        return
+
+    channel_id = int(
+        callback.data.split(":")[-1]
+    )
+
+    settings = await db.get_settings()
+
+    channel = next(
+        (
+            x for x in settings["channels"]
+            if x["id"] == channel_id
+        ),
+        None
+    )
+
+    if not channel:
+
+        await callback.answer(
+            "Channel not found.",
+            show_alert=True
+        )
+
+        return
+
+    await state.set_state(
+        AdminState.edit_channel
+    )
+
+    await state.update_data(
+        channel_id=channel_id
+    )
+
+    await callback.message.edit_text(
+        "✏️ <b>Edit Channel</b>\n\n"
+        f"Current: <b>{escape(channel['title'])}</b>\n"
+        f"{escape(channel['url'])}\n"
+        f"Chat ID: <code>{escape(channel['chat_id'])}</code>\n\n"
+        "Send:\n"
+        "<code>Button Name | Link | Chat ID</code>",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+@dp.message(AdminState.edit_channel)
+async def edit_channel_save(
+    message: Message,
+    state: FSMContext
+):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.text == "/cancel":
+
+        await state.clear()
+
+        await send_admin_panel(
+            message
+        )
+
+        return
+
+    parsed = parse_channel(
+        message.text or ""
+    )
+
+    if not parsed:
+
+        await message.answer(
+            "❌ Invalid format."
+        )
+
+        return
+
+    data = await state.get_data()
+
+    await db.update_channel(
+        data["channel_id"],
+        *parsed
+   
